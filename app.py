@@ -8,7 +8,7 @@ from scipy.stats import binom, expon, norm, poisson, triang, weibull_min
 
 
 st.set_page_config(
-    page_title="Sandbox: Probability Distribution",
+    page_title="Playground: Probability Distribution",
     page_icon=":bar_chart:",
     layout="wide",
 )
@@ -490,7 +490,7 @@ def render_weibull():
         )
 
 
-st.title("Sandbox: Probability Distribution")
+st.title("Playground: Probability Distribution")
 st.caption(
     "Adjust business assumptions and watch the probability mass or density curve update automatically."
 )
