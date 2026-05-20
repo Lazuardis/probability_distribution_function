@@ -1,10 +1,11 @@
 import math
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from scipy.stats import binom, expon, norm, poisson, triang, weibull_min
+from scipy.stats import binom, expon, gaussian_kde, norm, poisson, triang, weibull_min
 
 
 st.set_page_config(
@@ -17,6 +18,13 @@ st.set_page_config(
 PRIMARY = "#2563eb"
 SECONDARY = "#f97316"
 FILL = "rgba(37, 99, 235, 0.18)"
+SHADE = "rgba(249, 115, 22, 0.28)"
+ELIGIBLE_CLASSES = ["A", "B", "C", "IUP", "G"]
+KDE_COLUMNS = {
+    "Travel time to campus": "How long does it take for you to go from your place to campus in minutes?",
+    "Daily stipend": "What is your daily stipend?",
+    "Courses with grade A": "How many courses did you get A?",
+}
 
 
 def format_number(value, decimals=2, prefix="", suffix=""):
@@ -31,6 +39,53 @@ def stats_table(rows):
         hide_index=True,
         width="stretch",
     )
+
+
+def normalize_column_name(column):
+    return " ".join(str(column).replace("\xa0", " ").split()).casefold()
+
+
+def read_uploaded_csv(uploaded_file):
+    raw = uploaded_file.getvalue()
+    last_error = None
+
+    for encoding in ["utf-8-sig", "cp1252", "latin1"]:
+        try:
+            return pd.read_csv(BytesIO(raw), sep=None, engine="python", encoding=encoding)
+        except UnicodeDecodeError as error:
+            last_error = error
+        except pd.errors.ParserError as error:
+            last_error = error
+
+    raise ValueError(f"Could not read CSV file. Last parser error: {last_error}")
+
+
+def resolve_required_columns(df):
+    normalized_lookup = {normalize_column_name(column): column for column in df.columns}
+    required = {"Kelas": "Kelas", **KDE_COLUMNS}
+    resolved = {}
+    missing = []
+
+    for label, expected_column in required.items():
+        normalized = normalize_column_name(expected_column)
+        if normalized in normalized_lookup:
+            resolved[label] = normalized_lookup[normalized]
+        else:
+            missing.append(expected_column)
+
+    return resolved, missing
+
+
+def parse_numeric_series(series):
+    numeric = pd.to_numeric(series, errors="coerce")
+    cleaned = (
+        series.astype(str)
+        .str.replace(r"[^\d,.\-]", "", regex=True)
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    cleaned_numeric = pd.to_numeric(cleaned, errors="coerce")
+    return numeric.fillna(cleaned_numeric)
 
 
 def make_discrete_chart(x, pmf, cdf, title, x_label, y_label, show_cdf):
@@ -76,6 +131,52 @@ def make_discrete_chart(x, pmf, cdf, title, x_label, y_label, show_cdf):
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=20, r=20, t=70, b=20),
         height=470,
+    )
+    fig.update_yaxes(rangemode="tozero")
+    return fig
+
+
+def make_kde_chart(x, density, from_value, to_value, title, x_label):
+    fig = go.Figure()
+    shaded = (x >= from_value) & (x <= to_value)
+
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=density,
+            name="Kernel density estimate",
+            mode="lines",
+            fill="tozeroy",
+            fillcolor=FILL,
+            line=dict(color=PRIMARY, width=3),
+            hovertemplate=f"{x_label}: %{{x:.2f}}<br>Density: %{{y:.5f}}<extra></extra>",
+        )
+    )
+
+    if shaded.any():
+        fig.add_trace(
+            go.Scatter(
+                x=x[shaded],
+                y=density[shaded],
+                name="Selected probability range",
+                mode="lines",
+                fill="tozeroy",
+                fillcolor=SHADE,
+                line=dict(color=SECONDARY, width=0),
+                hovertemplate=f"{x_label}: %{{x:.2f}}<br>Density: %{{y:.5f}}<extra></extra>",
+            )
+        )
+
+    fig.add_vline(x=from_value, line_color=SECONDARY, line_dash="dash")
+    fig.add_vline(x=to_value, line_color=SECONDARY, line_dash="dash")
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title="Estimated density",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=20, r=20, t=70, b=20),
+        height=430,
     )
     fig.update_yaxes(rangemode="tozero")
     return fig
@@ -143,6 +244,139 @@ def make_continuous_chart(x, pdf, cdf, title, x_label, show_cdf, samples=None):
     )
     fig.update_yaxes(rangemode="tozero")
     return fig
+
+
+def render_kde_metric(metric_label, column_name, df, selected_class):
+    values = parse_numeric_series(df[column_name]).dropna()
+    st.markdown(f"#### {metric_label}")
+
+    if values.empty:
+        st.warning("No numeric values are available for this class and question.")
+        return
+
+    stats_table(
+        [
+            ["Class", selected_class],
+            ["Valid observations", len(values)],
+            ["Minimum", format_number(values.min())],
+            ["Median", format_number(values.median())],
+            ["Maximum", format_number(values.max())],
+        ]
+    )
+
+    if len(values) < 2 or values.nunique() < 2:
+        st.warning(
+            "KDE needs at least two different numeric values. Add more varied responses for this class "
+            "to estimate a smooth density curve."
+        )
+        return
+
+    data_min = float(values.min())
+    data_max = float(values.max())
+    spread = data_max - data_min
+    padding = max(spread * 0.15, 1.0)
+    x_min = data_min - padding
+    x_max = data_max + padding
+    x = np.linspace(x_min, x_max, 500)
+    kde = gaussian_kde(values)
+    density = kde(x)
+
+    default_from = float(values.quantile(0.25))
+    default_to = float(values.quantile(0.75))
+    input_col_1, input_col_2, result_col = st.columns([1, 1, 1.2])
+    with input_col_1:
+        from_value = st.number_input(
+            "From value",
+            value=default_from,
+            min_value=float(x_min),
+            max_value=float(x_max),
+            step=max(spread / 100, 1.0),
+            key=f"kde_from_{metric_label}",
+        )
+    with input_col_2:
+        to_value = st.number_input(
+            "To value",
+            value=default_to,
+            min_value=float(x_min),
+            max_value=float(x_max),
+            step=max(spread / 100, 1.0),
+            key=f"kde_to_{metric_label}",
+        )
+
+    lower = min(from_value, to_value)
+    upper = max(from_value, to_value)
+    probability = float(kde.integrate_box_1d(lower, upper))
+    with result_col:
+        st.metric(
+            "Estimated probability",
+            f"{probability:.2%}",
+            help="Calculated by integrating the KDE curve between the selected values.",
+        )
+
+    st.plotly_chart(
+        make_kde_chart(
+            x,
+            density,
+            lower,
+            upper,
+            f"KDE for {metric_label} in class {selected_class}",
+            metric_label,
+        ),
+        width="stretch",
+    )
+
+
+def render_kernel_density_tab():
+    st.subheader("Kernel Density Function")
+    st.write(
+        "Upload the survey CSV, choose a class, then set a from-to range to estimate probability "
+        "from the KDE curve for each numeric question."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload CSV file",
+        type=["csv"],
+        help="The app accepts comma- or semicolon-delimited CSV files.",
+    )
+
+    if uploaded_file is None:
+        st.write(
+            "Expected columns: Kelas, travel time to campus in minutes, daily stipend, and number "
+            "of courses with grade A."
+        )
+        return
+
+    try:
+        df = read_uploaded_csv(uploaded_file)
+    except ValueError as error:
+        st.error(str(error))
+        return
+
+    resolved, missing = resolve_required_columns(df)
+    if missing:
+        st.error("The uploaded file is missing required columns.")
+        st.dataframe(pd.DataFrame({"Missing column": missing}), hide_index=True, width="stretch")
+        return
+
+    class_column = resolved["Kelas"]
+    clean_df = df.copy()
+    clean_df[class_column] = clean_df[class_column].astype(str).str.strip().str.upper()
+
+    class_col, preview_col = st.columns([0.9, 1.6], gap="large")
+    with class_col:
+        selected_class = st.selectbox("Choose class", ELIGIBLE_CLASSES)
+        filtered_df = clean_df[clean_df[class_column] == selected_class]
+        st.metric("Rows in selected class", len(filtered_df))
+    with preview_col:
+        st.caption("Uploaded data preview")
+        st.dataframe(clean_df.head(8), hide_index=True, width="stretch")
+
+    if filtered_df.empty:
+        st.warning(f"No rows found for class {selected_class}. Choose another class or upload more data.")
+        return
+
+    for metric_label, expected_column in KDE_COLUMNS.items():
+        render_kde_metric(metric_label, resolved[metric_label], filtered_df, selected_class)
 
 
 def render_binomial():
@@ -495,7 +729,9 @@ st.caption(
     "Adjust business assumptions and watch the probability mass or density curve update automatically."
 )
 
-discrete_tab, continuous_tab = st.tabs(["Discrete Distributions", "Continuous Distributions"])
+discrete_tab, continuous_tab, kde_tab = st.tabs(
+    ["Discrete Distributions", "Continuous Distributions", "Kernel Density Function"]
+)
 
 with discrete_tab:
     selected = st.selectbox(
@@ -525,3 +761,6 @@ with continuous_tab:
         render_triangular()
     else:
         render_weibull()
+
+with kde_tab:
+    render_kernel_density_tab()
