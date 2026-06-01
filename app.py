@@ -5,7 +5,17 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from scipy.stats import binom, expon, gaussian_kde, norm, poisson, triang, weibull_min
+from scipy.stats import (
+    binom,
+    chisquare,
+    expon,
+    gaussian_kde,
+    kstest,
+    norm,
+    poisson,
+    triang,
+    weibull_min,
+)
 
 
 st.set_page_config(
@@ -25,6 +35,36 @@ KDE_COLUMNS = {
     "Daily stipend": "What is your daily stipend?",
     "Courses with grade A": "How many courses did you get A?",
 }
+SYNTHETIC_SEED = 20260602
+
+
+def build_goodness_of_fit_datasets():
+    rng = np.random.default_rng(SYNTHETIC_SEED)
+    hourly_checkouts = rng.binomial(n=40, p=0.55, size=180)
+    salaries = rng.normal(loc=8_500_000, scale=1_850_000, size=170)
+    salaries = np.clip(salaries, 3_500_000, 16_500_000)
+    interarrival_times = rng.exponential(scale=6.5, size=180)
+
+    return {
+        "Number of item checkout per aggregate of 1 hour in an e-commerce": {
+            "values": pd.Series(hourly_checkouts, name="Item checkouts per hour"),
+            "generated_from": "Binomial",
+            "unit": "items",
+        },
+        "The salary of private corporation in Surabaya": {
+            "values": pd.Series(salaries, name="Monthly salary"),
+            "generated_from": "Normal",
+            "unit": "IDR",
+        },
+        "The interarrival time of customer in bank branch in Surabaya": {
+            "values": pd.Series(interarrival_times, name="Customer interarrival time"),
+            "generated_from": "Exponential",
+            "unit": "minutes",
+        },
+    }
+
+
+GOF_DATASETS = build_goodness_of_fit_datasets()
 
 
 def format_number(value, decimals=2, prefix="", suffix=""):
@@ -39,6 +79,10 @@ def stats_table(rows):
         hide_index=True,
         width="stretch",
     )
+
+
+def result_table(rows):
+    st.table(pd.DataFrame(rows, columns=["Item", "Value"]))
 
 
 def normalize_column_name(column):
@@ -182,6 +226,30 @@ def make_kde_chart(x, density, from_value, to_value, title, x_label):
     return fig
 
 
+def make_gof_histogram(values, variable_label):
+    fig = go.Figure()
+    fig.add_trace(
+        go.Histogram(
+            x=values,
+            name="Observed data",
+            marker_color=PRIMARY,
+            opacity=0.78,
+            nbinsx=min(max(values.nunique(), 8), 30),
+            hovertemplate=f"{variable_label}: %{{x}}<br>Count: %{{y}}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=f"Observed data for {variable_label}",
+        xaxis_title=variable_label,
+        yaxis_title="Count",
+        bargap=0.08,
+        margin=dict(l=20, r=20, t=70, b=20),
+        height=390,
+    )
+    fig.update_yaxes(rangemode="tozero")
+    return fig
+
+
 def make_continuous_chart(x, pdf, cdf, title, x_label, show_cdf, samples=None):
     fig = go.Figure()
 
@@ -244,6 +312,235 @@ def make_continuous_chart(x, pdf, cdf, title, x_label, show_cdf, samples=None):
     )
     fig.update_yaxes(rangemode="tozero")
     return fig
+
+
+def interpret_p_value(p_value, alpha=0.05):
+    if p_value < alpha:
+        return (
+            f"At alpha = {alpha:.2f}, this small p-value suggests the selected data does not "
+            "fit the hypothesized distribution well."
+        )
+
+    return (
+        f"At alpha = {alpha:.2f}, there is not enough evidence to reject the hypothesized "
+        "distribution for this selected data."
+    )
+
+
+def is_non_negative_integer_series(values):
+    return bool(((values >= 0) & np.isclose(values, np.round(values))).all())
+
+
+def merge_expected_bins(observed, expected, min_expected=5.0):
+    merged_observed = []
+    merged_expected = []
+    current_observed = 0.0
+    current_expected = 0.0
+
+    for observed_count, expected_count in zip(observed, expected):
+        current_observed += observed_count
+        current_expected += expected_count
+        if current_expected >= min_expected:
+            merged_observed.append(current_observed)
+            merged_expected.append(current_expected)
+            current_observed = 0.0
+            current_expected = 0.0
+
+    if current_expected > 0:
+        if merged_expected:
+            merged_observed[-1] += current_observed
+            merged_expected[-1] += current_expected
+        else:
+            merged_observed.append(current_observed)
+            merged_expected.append(current_expected)
+
+    return np.array(merged_observed), np.array(merged_expected)
+
+
+def run_discrete_gof(values, distribution):
+    if len(values) < 5:
+        raise ValueError("At least 5 observations are recommended for a Chi-square goodness-of-fit test.")
+    if not is_non_negative_integer_series(values):
+        raise ValueError("Discrete goodness-of-fit tests require non-negative integer-like data.")
+
+    data = np.round(values).astype(int)
+    sample_size = len(data)
+    max_value = int(data.max())
+    if max_value == 0:
+        raise ValueError("All observations are zero, so distribution parameters cannot be estimated reliably.")
+
+    if distribution == "Poisson":
+        lam = float(data.mean())
+        support = np.arange(0, max_value + 1)
+        observed = np.array([(data == value).sum() for value in support], dtype=float)
+        expected_prob = poisson.pmf(support, lam)
+        expected_prob[-1] += 1 - poisson.cdf(max_value, lam)
+        parameters = [["lambda", format_number(lam)]]
+        estimated_parameter_count = 1
+    else:
+        mean = float(data.mean())
+        variance = float(data.var(ddof=1))
+        if variance < mean:
+            n = max(max_value, int(round(mean**2 / (mean - variance))))
+        else:
+            n = max_value
+        p = float(mean / n)
+        p = min(max(p, 0.0), 1.0)
+        support = np.arange(0, n + 1)
+        observed = np.array([(data == value).sum() for value in support], dtype=float)
+        expected_prob = binom.pmf(support, n, p)
+        parameters = [["n", n], ["p", format_number(p, 4)]]
+        estimated_parameter_count = 2
+
+    expected = expected_prob * sample_size
+    min_expected = 5.0 if sample_size >= 50 else 1.0
+    observed, expected = merge_expected_bins(observed, expected, min_expected=min_expected)
+    if len(observed) < 2:
+        raise ValueError("The selected data does not have enough frequency variation after bin merging.")
+
+    expected = expected * (observed.sum() / expected.sum())
+    ddof = estimated_parameter_count
+    degrees_of_freedom = len(observed) - 1 - ddof
+    if degrees_of_freedom < 1:
+        raise ValueError(
+            "There are not enough merged bins to compute a valid Chi-square test after estimating parameters."
+        )
+
+    statistic, p_value = chisquare(observed, expected, ddof=ddof)
+    return {
+        "test": "Chi-square goodness-of-fit",
+        "statistic": float(statistic),
+        "p_value": float(p_value),
+        "degrees_of_freedom": int(degrees_of_freedom),
+        "parameters": parameters,
+        "sample_size": sample_size,
+        "bins": len(observed),
+    }
+
+
+def run_continuous_gof(values, distribution):
+    if len(values) < 5:
+        raise ValueError("At least 5 observations are recommended for a Kolmogorov-Smirnov test.")
+    if values.nunique() < 2:
+        raise ValueError("The selected variable needs at least two different numeric values.")
+
+    data = values.astype(float).to_numpy()
+
+    if distribution == "Normal":
+        mu = float(np.mean(data))
+        sigma = float(np.std(data, ddof=1))
+        if sigma <= 0:
+            raise ValueError("Normal distribution requires positive standard deviation.")
+        statistic, p_value = kstest(data, "norm", args=(mu, sigma))
+        parameters = [["mu", format_number(mu)], ["sigma", format_number(sigma)]]
+    elif distribution == "Exponential":
+        if np.any(data < 0):
+            raise ValueError("Exponential distribution requires non-negative data.")
+        scale = float(np.mean(data))
+        if scale <= 0:
+            raise ValueError("Exponential distribution requires positive mean.")
+        statistic, p_value = kstest(data, "expon", args=(0, scale))
+        parameters = [["loc", 0], ["scale", format_number(scale)]]
+    elif distribution == "Triangular":
+        c, loc, scale = triang.fit(data)
+        if scale <= 0:
+            raise ValueError("Triangular fit produced a non-positive scale.")
+        statistic, p_value = kstest(data, "triang", args=(c, loc, scale))
+        parameters = [
+            ["c", format_number(c, 4)],
+            ["loc", format_number(loc)],
+            ["scale", format_number(scale)],
+        ]
+    else:
+        if np.any(data < 0):
+            raise ValueError("Weibull distribution requires non-negative data when loc is fixed at 0.")
+        shape, loc, scale = weibull_min.fit(data, floc=0)
+        if shape <= 0 or scale <= 0:
+            raise ValueError("Weibull fit produced non-positive shape or scale.")
+        statistic, p_value = kstest(data, "weibull_min", args=(shape, loc, scale))
+        parameters = [
+            ["shape", format_number(shape, 4)],
+            ["loc", format_number(loc)],
+            ["scale", format_number(scale)],
+        ]
+
+    return {
+        "test": "Kolmogorov-Smirnov goodness-of-fit",
+        "statistic": float(statistic),
+        "p_value": float(p_value),
+        "parameters": parameters,
+        "sample_size": len(data),
+    }
+
+
+def render_goodness_of_fit_tab():
+    st.subheader("Goodness-of-Fit")
+    st.write(
+        "Select one synthetic business dataset, choose a hypothesized distribution, then compute "
+        "whether the observed data reasonably follows that distribution."
+    )
+
+    control_col, preview_col = st.columns([0.95, 1.45], gap="large")
+    with control_col:
+        variable_label = st.selectbox("Choose variable", list(GOF_DATASETS.keys()), key="gof_variable")
+        selected_dataset = GOF_DATASETS[variable_label]
+        data_type = st.selectbox("Treat variable as", ["Discrete", "Continuous"], key="gof_type")
+        if data_type == "Discrete":
+            distribution = st.selectbox(
+                "Hypothesized distribution",
+                ["Poisson", "Binomial"],
+                key="gof_discrete_distribution",
+            )
+        else:
+            distribution = st.selectbox(
+                "Hypothesized distribution",
+                ["Normal", "Exponential", "Triangular", "Weibull"],
+                key="gof_continuous_distribution",
+            )
+        compute = st.button("Compute", type="primary")
+        st.caption(
+            f"Synthetic sample size: {len(selected_dataset['values'])}. "
+            f"Generated from: {selected_dataset['generated_from']}."
+        )
+
+    values = parse_numeric_series(selected_dataset["values"]).dropna()
+
+    with preview_col:
+        if values.empty:
+            st.warning("No numeric values are available for the selected variable.")
+        else:
+            st.plotly_chart(
+                make_gof_histogram(values, variable_label),
+                width="stretch",
+            )
+
+    if not compute:
+        st.write("Click **Compute** to fit parameters and run the goodness-of-fit test.")
+        return
+
+    if values.empty:
+        st.warning("No numeric values are available for the selected variable.")
+        return
+
+    try:
+        if data_type == "Discrete":
+            result = run_discrete_gof(values, distribution)
+        else:
+            result = run_continuous_gof(values, distribution)
+    except ValueError as error:
+        st.warning(str(error))
+        return
+
+    metric_col_1, metric_col_2, metric_col_3 = st.columns(3)
+    metric_col_1.metric("Test statistic", f"{result['statistic']:.4f}")
+    metric_col_2.metric("p-value", f"{result['p_value']:.4f}")
+    metric_col_3.metric("Sample size", result["sample_size"])
+
+    st.write(interpret_p_value(result["p_value"]))
+    st.caption("The p-value is approximate because parameters are estimated from the selected data.")
+
+    st.write("Estimated parameters")
+    result_table(result["parameters"])
 
 
 def render_kde_metric(metric_label, column_name, df, selected_class):
@@ -729,8 +1026,13 @@ st.caption(
     "Adjust business assumptions and watch the probability mass or density curve update automatically."
 )
 
-discrete_tab, continuous_tab, kde_tab = st.tabs(
-    ["Discrete Distributions", "Continuous Distributions", "Kernel Density Function"]
+discrete_tab, continuous_tab, kde_tab, gof_tab = st.tabs(
+    [
+        "Discrete Distributions",
+        "Continuous Distributions",
+        "Kernel Density Function",
+        "Goodness-of-Fit",
+    ]
 )
 
 with discrete_tab:
@@ -764,3 +1066,6 @@ with continuous_tab:
 
 with kde_tab:
     render_kernel_density_tab()
+
+with gof_tab:
+    render_goodness_of_fit_tab()
