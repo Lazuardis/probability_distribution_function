@@ -226,18 +226,72 @@ def make_kde_chart(x, density, from_value, to_value, title, x_label):
     return fig
 
 
-def make_gof_histogram(values, variable_label):
+def make_gof_histogram(values, variable_label, data_type=None, distribution=None, result=None):
+    clean_values = pd.Series(values).dropna()
     fig = go.Figure()
+    bin_count = min(max(clean_values.nunique(), 8), 30)
+    counts, edges = np.histogram(clean_values, bins=bin_count)
+    bin_width = float(edges[1] - edges[0]) if len(edges) > 1 else 1.0
+
     fig.add_trace(
         go.Histogram(
-            x=values,
+            x=clean_values,
             name="Observed data",
             marker_color=PRIMARY,
             opacity=0.78,
-            nbinsx=min(max(values.nunique(), 8), 30),
+            nbinsx=bin_count,
             hovertemplate=f"{variable_label}: %{{x}}<br>Count: %{{y}}<extra></extra>",
         )
     )
+
+    if result is not None:
+        params = result["raw_parameters"]
+        sample_size = result["sample_size"]
+        if data_type == "Discrete":
+            observed_min = int(np.floor(clean_values.min()))
+            observed_max = int(np.ceil(clean_values.max()))
+            if distribution == "Poisson":
+                x = np.arange(observed_min, observed_max + 1)
+                y = poisson.pmf(x, params["lambda"]) * sample_size
+            else:
+                x = np.arange(observed_min, observed_max + 1)
+                y = binom.pmf(x, params["n"], params["p"]) * sample_size
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=y,
+                    name=f"Fitted {distribution}",
+                    mode="lines+markers",
+                    line=dict(color=SECONDARY, width=3),
+                    hovertemplate=f"{variable_label}: %{{x}}<br>Expected count: %{{y:.2f}}<extra></extra>",
+                )
+            )
+        else:
+            x = np.linspace(float(clean_values.min()), float(clean_values.max()), 400)
+            if distribution == "Normal":
+                y = norm.pdf(x, params["mu"], params["sigma"])
+            elif distribution == "Exponential":
+                y = expon.pdf(x, loc=params["loc"], scale=params["scale"])
+            elif distribution == "Triangular":
+                y = triang.pdf(x, params["c"], loc=params["loc"], scale=params["scale"])
+            else:
+                y = weibull_min.pdf(
+                    x,
+                    params["shape"],
+                    loc=params["loc"],
+                    scale=params["scale"],
+                )
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=y * sample_size * bin_width,
+                    name=f"Fitted {distribution}",
+                    mode="lines",
+                    line=dict(color=SECONDARY, width=3),
+                    hovertemplate=f"{variable_label}: %{{x:.2f}}<br>Expected count: %{{y:.2f}}<extra></extra>",
+                )
+            )
+
     fig.update_layout(
         title=f"Observed data for {variable_label}",
         xaxis_title=variable_label,
@@ -376,6 +430,7 @@ def run_discrete_gof(values, distribution):
         expected_prob = poisson.pmf(support, lam)
         expected_prob[-1] += 1 - poisson.cdf(max_value, lam)
         parameters = [["lambda", format_number(lam)]]
+        raw_parameters = {"lambda": lam}
         estimated_parameter_count = 1
     else:
         mean = float(data.mean())
@@ -390,6 +445,7 @@ def run_discrete_gof(values, distribution):
         observed = np.array([(data == value).sum() for value in support], dtype=float)
         expected_prob = binom.pmf(support, n, p)
         parameters = [["n", n], ["p", format_number(p, 4)]]
+        raw_parameters = {"n": n, "p": p}
         estimated_parameter_count = 2
 
     expected = expected_prob * sample_size
@@ -413,6 +469,7 @@ def run_discrete_gof(values, distribution):
         "p_value": float(p_value),
         "degrees_of_freedom": int(degrees_of_freedom),
         "parameters": parameters,
+        "raw_parameters": raw_parameters,
         "sample_size": sample_size,
         "bins": len(observed),
     }
@@ -433,6 +490,7 @@ def run_continuous_gof(values, distribution):
             raise ValueError("Normal distribution requires positive standard deviation.")
         statistic, p_value = kstest(data, "norm", args=(mu, sigma))
         parameters = [["mu", format_number(mu)], ["sigma", format_number(sigma)]]
+        raw_parameters = {"mu": mu, "sigma": sigma}
     elif distribution == "Exponential":
         if np.any(data < 0):
             raise ValueError("Exponential distribution requires non-negative data.")
@@ -441,6 +499,7 @@ def run_continuous_gof(values, distribution):
             raise ValueError("Exponential distribution requires positive mean.")
         statistic, p_value = kstest(data, "expon", args=(0, scale))
         parameters = [["loc", 0], ["scale", format_number(scale)]]
+        raw_parameters = {"loc": 0.0, "scale": scale}
     elif distribution == "Triangular":
         c, loc, scale = triang.fit(data)
         if scale <= 0:
@@ -451,6 +510,7 @@ def run_continuous_gof(values, distribution):
             ["loc", format_number(loc)],
             ["scale", format_number(scale)],
         ]
+        raw_parameters = {"c": c, "loc": loc, "scale": scale}
     else:
         if np.any(data < 0):
             raise ValueError("Weibull distribution requires non-negative data when loc is fixed at 0.")
@@ -463,12 +523,14 @@ def run_continuous_gof(values, distribution):
             ["loc", format_number(loc)],
             ["scale", format_number(scale)],
         ]
+        raw_parameters = {"shape": shape, "loc": loc, "scale": scale}
 
     return {
         "test": "Kolmogorov-Smirnov goodness-of-fit",
         "statistic": float(statistic),
         "p_value": float(p_value),
         "parameters": parameters,
+        "raw_parameters": raw_parameters,
         "sample_size": len(data),
     }
 
@@ -509,10 +571,8 @@ def render_goodness_of_fit_tab():
         if values.empty:
             st.warning("No numeric values are available for the selected variable.")
         else:
-            st.plotly_chart(
-                make_gof_histogram(values, variable_label),
-                width="stretch",
-            )
+            histogram_slot = st.empty()
+            histogram_slot.plotly_chart(make_gof_histogram(values, variable_label), width="stretch")
 
     if not compute:
         st.write("Click **Compute** to fit parameters and run the goodness-of-fit test.")
@@ -530,6 +590,12 @@ def render_goodness_of_fit_tab():
     except ValueError as error:
         st.warning(str(error))
         return
+
+    if not values.empty:
+        histogram_slot.plotly_chart(
+            make_gof_histogram(values, variable_label, data_type, distribution, result),
+            width="stretch",
+        )
 
     metric_col_1, metric_col_2, metric_col_3 = st.columns(3)
     metric_col_1.metric("Test statistic", f"{result['statistic']:.4f}")
