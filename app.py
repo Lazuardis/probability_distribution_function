@@ -132,6 +132,56 @@ def parse_numeric_series(series):
     return numeric.fillna(cleaned_numeric)
 
 
+def calculate_mm_c_queue(lambda_rate, mu_rate, servers):
+    if lambda_rate <= 0:
+        raise ValueError("Arrival rate must be greater than 0.")
+    if mu_rate <= 0:
+        raise ValueError("Service rate must be greater than 0.")
+    if servers < 1:
+        raise ValueError("Number of servers must be at least 1.")
+
+    utilization = lambda_rate / (servers * mu_rate)
+    if utilization >= 1:
+        return {
+            "stable": False,
+            "utilization": utilization,
+        }
+
+    traffic_intensity = lambda_rate / mu_rate
+    base_sum = sum(
+        (traffic_intensity**n) / math.factorial(n)
+        for n in range(servers)
+    )
+    tail_term = (
+        traffic_intensity**servers
+        / (math.factorial(servers) * (1 - utilization))
+    )
+    p0 = 1 / (base_sum + tail_term)
+    average_number_waiting = (
+        p0
+        * (traffic_intensity**servers)
+        * utilization
+        / (math.factorial(servers) * ((1 - utilization) ** 2))
+    )
+    average_waiting_time_queue = average_number_waiting / lambda_rate
+    average_time_system = average_waiting_time_queue + (1 / mu_rate)
+    average_number_system = lambda_rate * average_time_system
+
+    return {
+        "stable": True,
+        "utilization": utilization,
+        "p0": p0,
+        "average_number_waiting": average_number_waiting,
+        "average_number_system": average_number_system,
+        "average_waiting_time_queue": average_waiting_time_queue,
+        "average_time_system": average_time_system,
+    }
+
+
+def format_queue_time(hours):
+    return f"{hours:.4f} hours ({hours * 60:.2f} minutes)"
+
+
 def make_discrete_chart(x, pmf, cdf, title, x_label, y_label, show_cdf):
     fig = go.Figure()
     fig.add_trace(
@@ -607,6 +657,96 @@ def render_goodness_of_fit_tab():
 
     st.write("Estimated parameters")
     result_table(result["parameters"])
+
+
+def render_queueing_theory_tab():
+    st.subheader("Queueing Theory")
+    st.write(
+        "Calculate steady-state M/M/c queue metrics using the arrival rate, service rate per server, "
+        "and number of parallel servers."
+    )
+
+    control_col, result_col = st.columns([0.9, 1.5], gap="large")
+    with control_col:
+        lambda_rate = st.number_input(
+            "Arrival rate, lambda (customers per hour)",
+            min_value=0.01,
+            value=30.0,
+            step=1.0,
+            format="%.2f",
+        )
+        mu_rate = st.number_input(
+            "Service rate, mu (customers served per server per hour)",
+            min_value=0.01,
+            value=20.0,
+            step=1.0,
+            format="%.2f",
+        )
+        servers = st.number_input(
+            "Number of servers, c",
+            min_value=1,
+            value=2,
+            step=1,
+        )
+
+        result = calculate_mm_c_queue(lambda_rate, mu_rate, int(servers))
+        st.metric("Utilization", f"{result['utilization']:.2%}")
+
+        if result["stable"]:
+            st.write(
+                "The system is stable because utilization is below 100%, so steady-state queue "
+                "metrics can be calculated."
+            )
+        else:
+            st.warning(
+                "The system is unstable because utilization is at least 100%. In steady state, "
+                "the queue would grow over time, so waiting-time and queue-length metrics are not computed."
+            )
+
+    with result_col:
+        if result["stable"]:
+            metric_col_1, metric_col_2 = st.columns(2)
+            metric_col_1.metric(
+                "Average Number Waiting (Lq)",
+                f"{result['average_number_waiting']:.2f}",
+            )
+            metric_col_2.metric(
+                "Average Number in System (L)",
+                f"{result['average_number_system']:.2f}",
+            )
+
+            metric_col_3, metric_col_4 = st.columns(2)
+            metric_col_3.metric(
+                "Average Waiting Time in Queue (Wq)",
+                format_queue_time(result["average_waiting_time_queue"]),
+            )
+            metric_col_4.metric(
+                "Average Time in System (W)",
+                format_queue_time(result["average_time_system"]),
+            )
+
+            st.write("Formula reference")
+            result_table(
+                [
+                    ["Model", "M/M/c"],
+                    ["Utilization", "rho = lambda / (c * mu)"],
+                    ["Probability system is empty", "P0 = [sum((lambda/mu)^n / n!) + tail term]^-1"],
+                    ["Average Number Waiting", "Lq = P0(lambda/mu)^c rho / (c!(1-rho)^2)"],
+                    ["Average Waiting Time in Queue", "Wq = Lq / lambda"],
+                    ["Average Time in System", "W = Wq + 1 / mu"],
+                    ["Average Number in System", "L = lambda * W"],
+                ]
+            )
+            st.caption(f"Probability the system is empty, P0 = {result['p0']:.4f}")
+        else:
+            st.write("Formula reference")
+            result_table(
+                [
+                    ["Model", "M/M/c"],
+                    ["Utilization", "rho = lambda / (c * mu)"],
+                    ["Stability condition", "rho < 1"],
+                ]
+            )
 
 
 def render_kde_metric(metric_label, column_name, df, selected_class):
@@ -1092,12 +1232,13 @@ st.caption(
     "Adjust business assumptions and watch the probability mass or density curve update automatically."
 )
 
-discrete_tab, continuous_tab, kde_tab, gof_tab = st.tabs(
+discrete_tab, continuous_tab, kde_tab, gof_tab, queue_tab = st.tabs(
     [
         "Discrete Distributions",
         "Continuous Distributions",
         "Kernel Density Function",
         "Goodness-of-Fit",
+        "Queueing Theory",
     ]
 )
 
@@ -1135,3 +1276,6 @@ with kde_tab:
 
 with gof_tab:
     render_goodness_of_fit_tab()
+
+with queue_tab:
+    render_queueing_theory_tab()
