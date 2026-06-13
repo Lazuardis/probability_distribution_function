@@ -41,6 +41,13 @@ def parse_numeric_series(series):
     cleaned_numeric = pd.to_numeric(cleaned, errors="coerce")
     return numeric.fillna(cleaned_numeric)
 
+def normalize_column_names(df):
+    normalized_map = {
+        col: str(col).strip().lower().replace(" ", "_")
+        for col in df.columns
+        if isinstance(col, str)
+    }
+    return df.rename(columns=normalized_map)
 
 def load_queue_data(uploaded_file):
     file_name = uploaded_file.name.lower()
@@ -50,7 +57,8 @@ def load_queue_data(uploaded_file):
         last_error = None
         for encoding in ["utf-8-sig", "cp1252", "latin1"]:
             try:
-                return pd.read_csv(BytesIO(raw), sep=None, engine="python", encoding=encoding)
+                df = pd.read_csv(BytesIO(raw), sep=None, engine="python", encoding=encoding)
+                return normalize_column_names(df)
             except UnicodeDecodeError as error:
                 last_error = error
             except pd.errors.ParserError as error:
@@ -58,7 +66,7 @@ def load_queue_data(uploaded_file):
         raise ValueError(f"Could not read CSV file. Last parser error: {last_error}")
 
     if file_name.endswith(".xlsx"):
-        return pd.read_excel(BytesIO(raw), engine="openpyxl")
+        return normalize_column_names(pd.read_excel(BytesIO(raw), engine="openpyxl"))
 
     raise ValueError("Please upload a .csv or .xlsx file.")
 
